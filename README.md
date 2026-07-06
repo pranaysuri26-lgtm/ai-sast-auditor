@@ -1,73 +1,115 @@
-# AI SAST Auditor — editor bar
+# 🛡️ AI SAST Auditor
 
-A one-click AI security audit, run from a **status-bar button** in VS Code. No
-web page. Click **🛡️ SAST Audit**, and Claude (Opus 4.8) audits the open
-workspace for authentication bypasses, insecure deserialization, business-logic
-flaws, and the full OWASP Top 10 — then drops findings into the **Problems**
-panel with CWE, attack vector, proof-of-concept, and a fix on each.
+A one-click AI security audit, run from a **status-bar button** in VS Code — or
+from the CLI and CI. Point it at a codebase and Claude (Opus 4.8) performs a
+static application security review focused on the bugs that actually get you
+breached: **authentication/authorization bypasses, insecure deserialization,
+business-logic flaws, and the full OWASP Top 10** — not style or syntax noise.
 
-## How it works
+Findings land in the **Problems panel** (or as SARIF / Markdown) with a CWE ID,
+attack vector, proof-of-concept, verification trace, and a concrete fix on each.
 
-- **`sast_auditor.py`** — the core. Runs a local agentic **scout → verify** loop:
-  Claude drives `list_files` / `read_file` / `search_code` over your local files
-  (sandboxed to the workspace), verifies each candidate (traces routing +
-  middleware + schema to kill false positives), then emits every finding through
-  a strict `submit_report` tool — so the output is schema-validated by
-  construction. Your whole repo is never bulk-uploaded; only the snippets Claude
-  chooses to read are sent.
-- **`extension.js` / `package.json`** — the VS Code bar: a status-bar button, a
-  command, and a `DiagnosticCollection` that renders findings in Problems.
+> Built for auditing code **you own or are authorized to test**.
 
-## Setup
+---
+
+## What makes it different from a generic "AI code review"
+
+- **Scout → verify loop.** It doesn't just pattern-match. It maps entry points,
+  follows untrusted input across files, and then *verifies* each candidate —
+  tracing routing, middleware, and DB policies to rule out false positives before
+  reporting. Every finding carries the trace it used to confirm exploitability.
+- **Reports one finding at a time** through a strict schema tool, so results are
+  always well-formed (no truncated or hallucinated report blobs).
+- **Secret-safe.** It redacts `.env` values and hardcoded key literals *before*
+  they reach the model, so it can flag "committed secrets" without ever
+  exfiltrating them. A security tool shouldn't be a data-exfiltration risk.
+- **Framework-aware.** It fingerprints the stack first (Next.js/Supabase, Django,
+  Rails, Spring, …) and hunts for that stack's specific footguns.
+
+## Example findings
+
+Run against a real Next.js + Supabase app, it surfaced (among others):
+
+| Severity | Finding | CWE |
+|---|---|---|
+| CRITICAL | Committed `service_role` key + API keys in `.env.local` | CWE-798 |
+| CRITICAL | RLS policy `USING (share_token IS NOT NULL)` is always-true → every user's data readable with the public anon key | CWE-284 |
+| MEDIUM | Unauthenticated SSRF via unanchored URL regex → `fetch(rawUrl)` | CWE-918 |
+| MEDIUM | Unauthenticated LLM endpoints (unbounded cost/DoS) | CWE-770 |
+
+---
+
+## Install (VS Code button)
 
 ```bash
-# 1. Install the Python core's dependency
-cd vscode-sast
-pip install -r requirements.txt
+git clone <your-repo-url> && cd ai-sast-auditor
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
-# 2. Export your key in the shell you'll launch VS Code from
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# 3. Launch VS Code from that same shell so it inherits the key
-code .
-```
-
-## Run the extension
-
-**Quickest (debug host):** open the `vscode-sast` folder in VS Code and press
-**F5**. A second "Extension Development Host" window opens with the 🛡️ button in
-its status bar. Open the project you want to audit in that window and click it.
-
-**Install it for real:**
-
-```bash
-npm install -g @vscode/vsce
-cd vscode-sast
-vsce package                       # produces ai-sast-auditor-0.0.1.vsix
+# Package and install the extension
+npx @vscode/vsce package --no-dependencies --allow-star-activation
 code --install-extension ai-sast-auditor-0.0.1.vsix
 ```
 
-Then reload VS Code — the 🛡️ **SAST Audit** button appears in the status bar.
+Then in VS Code:
+1. Set `sast.pythonPath` (Settings → search "sast") to your venv's Python, e.g.
+   `/path/to/ai-sast-auditor/.venv/bin/python`.
+2. Export your key in the shell you launch VS Code from: `export ANTHROPIC_API_KEY=sk-ant-...` then `code .`
+3. Reload the window — the **🛡️ SAST Audit** button appears in the status bar.
+   Open a project, click it, and watch **Output → AI SAST Auditor**.
 
-## Use the core standalone (or in CI)
+## Use the CLI (and CI)
 
 ```bash
-python sast_auditor.py /path/to/project           # human-readable report
-python sast_auditor.py /path/to/project --json     # JSON on stdout only
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python sast_auditor.py /path/to/project                       # human-readable report
+python sast_auditor.py /path/to/project --json                 # JSON on stdout only
+python sast_auditor.py /path/to/project --sarif out.sarif --md out.md
 ```
 
-The `--json` mode prints nothing but the report object to stdout (progress goes
-to stderr), so it pipes cleanly into a CI step or another tool.
+`--sarif` emits SARIF 2.1.0 — the standard format GitHub code scanning ingests.
+See [`.github/workflows/sast.yml`](.github/workflows/sast.yml) for a ready-to-use
+GitHub Action that runs the audit and uploads findings to your repo's Security
+tab. Add your key as the `ANTHROPIC_API_KEY` repo secret first.
 
-## Settings
+---
 
-- `sast.pythonPath` — interpreter used to run the auditor (default `python3`).
-  Point this at the venv where you installed `anthropic` if it isn't on PATH.
+## How it works
 
-## Notes & limits
+```
+list_files / search_code / read_file   ← Claude explores (sandboxed to the repo)
+          │   (secret files redacted en route)
+          ▼
+   scout → verify each candidate
+          │
+          ▼
+   report_finding  (one strict-schema call per finding)
+          ▼
+   finish_audit → summary + cost  →  Problems panel / SARIF / Markdown / JSON
+```
 
-- Model is `claude-opus-4-8` (top reasoning, no cyber-classifier refusal path).
-  Change `MODEL` in `sast_auditor.py` to use another.
-- This is for auditing code **you own or are authorized to test**.
-- The audit is one shot per click; large repos take a few minutes. Watch the
-  **Output → AI SAST Auditor** channel for live progress.
+The whole repo is never bulk-uploaded — only the snippets Claude chooses to read
+are sent, and secret-bearing files are redacted first.
+
+## Configuration
+
+| Where | Setting | Default | Notes |
+|---|---|---|---|
+| `sast_auditor.py` | `MODEL` | `claude-opus-4-8` | Swap to `claude-sonnet-4-6` for ~40% cheaper, slightly less thorough runs. |
+| `sast_auditor.py` | `EFFORT` | `medium` | `low` \| `medium` \| `high` \| `max`. Higher = more thorough, more tokens. |
+| VS Code | `sast.pythonPath` | `python3` | Point at the venv with `anthropic` installed. |
+
+Each run prints an **estimated cost** (prompt caching keeps repeat context at
+~0.1× price). Expect a few cents to ~$1 depending on repo size and effort.
+
+## Limitations
+
+- It's an assistant, not a guarantee — treat findings as leads to verify, and
+  absence of findings as "nothing obvious found," not "secure."
+- Static analysis only; it reads code, it doesn't run or fuzz the app.
+- Costs real API tokens per run.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -131,20 +131,24 @@ function render(report, root) {
   }
 
   const counts = findings.reduce((m, f) => ((m[f.severity] = (m[f.severity] || 0) + 1), m), {});
+  const cost = report.usage && report.usage.estimated_cost_usd;
+  const costStr = cost != null ? `  ~$${cost}` : "";
   const summary =
     `SAST complete — ${findings.length} finding(s): ` +
     ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
       .filter((s) => counts[s])
       .map((s) => `${counts[s]} ${s}`)
-      .join(", ");
+      .join(", ") + costStr;
 
   output.appendLine("\n" + "=".repeat(60));
   output.appendLine(report.summary || "");
-  output.appendLine(`Files reviewed: ${report.files_reviewed || 0}`);
+  output.appendLine(
+    `Files reviewed: ${report.files_reviewed || 0}` + (cost != null ? `  ·  est. cost ~$${cost}` : "")
+  );
   if (report.notes) output.appendLine("Notes: " + report.notes);
 
   if (findings.length === 0) {
-    vscode.window.showInformationMessage("SAST complete — no findings.");
+    vscode.window.showInformationMessage("SAST complete — no findings." + costStr);
   } else {
     vscode.window.showWarningMessage(summary + "  (see Problems panel)");
     vscode.commands.executeCommand("workbench.actions.view.problems");

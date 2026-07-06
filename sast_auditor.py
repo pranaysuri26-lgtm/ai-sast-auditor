@@ -3,8 +3,10 @@ Local AI SAST Auditor core.
 
 Runs an agentic scout -> verify loop over a LOCAL directory. Claude drives
 list_files / read_file / search_code tools itself (client-side, sandboxed to the
-target directory), then emits every finding through a strict `submit_report`
-tool — so the structured output is schema-validated by construction.
+target directory) and records each verified finding through a strict
+`report_finding` tool, so every finding is schema-validated by construction.
+Secret-bearing files (.env, private keys) are redacted before their contents ever
+reach the model — the tool flags "committed secrets" without exfiltrating them.
 
 Focus (in priority order): authentication/authorization bypasses, insecure
 deserialization, business-logic flaws, then the full OWASP Top 10. Ignores style
@@ -54,6 +56,26 @@ SKIP_EXT = {
     ".zip", ".gz", ".tar", ".map", ".woff", ".woff2", ".ttf", ".eot", ".mp4",
     ".mov", ".mp3", ".bin", ".so", ".dll", ".class", ".pyc",
 }
+
+# Files whose *values* must never be sent to the model — only the key names are
+# useful for a "committed secrets" finding, never the secret material itself.
+SECRET_FILE_NAMES = {".env", ".npmrc", ".pypirc", "credentials", ".netrc", ".pgpass"}
+SECRET_FILE_GLOBS = (
+    ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12", "*.keystore",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "*_rsa", "*.ppk",
+)
+# High-entropy secret literals stripped from ANY file (hardcoded keys in source).
+SECRET_LITERAL_RE = re.compile(
+    r"sk-[A-Za-z0-9_-]{16,}"                                   # OpenAI / Anthropic keys
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"  # JWTs
+    r"|AKIA[0-9A-Z]{12,}"                                      # AWS access key id
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"                             # GitHub tokens
+    r"|[A-Za-z0-9+/]{40,}={0,2}"                               # long base64 blobs
+)
+
+# Rough pricing per 1M tokens (Claude Opus 4.8) for an at-a-glance cost estimate.
+PRICE_IN, PRICE_OUT = 5.0, 25.0
+PRICE_CACHE_WRITE, PRICE_CACHE_READ = 6.25, 0.50
 
 # --- Structured output schema (enriched: CWE + attack vector + PoC + verification) ---
 
@@ -212,6 +234,19 @@ def _clean_text(s) -> str:
     return s.strip()
 
 
+def _is_secret_file(rel: str) -> bool:
+    name = Path(rel).name
+    return name in SECRET_FILE_NAMES or any(fnmatch.fnmatch(name, g) for g in SECRET_FILE_GLOBS)
+
+
+def _redact_line(line: str, is_secret_file: bool) -> str:
+    # In a secret file (.env etc.), keep the key name but mask every value.
+    if is_secret_file and "=" in line and not line.lstrip().startswith("#"):
+        return line.partition("=")[0] + "=<REDACTED>"
+    # In any file, strip hardcoded secret literals so they never reach the model.
+    return SECRET_LITERAL_RE.sub("<REDACTED>", line)
+
+
 class Workspace:
     """Client-side file tools, sandboxed to the project root."""
 
@@ -257,10 +292,14 @@ class Workspace:
             text = data.decode("utf-8", errors="replace")
         except Exception:
             return f"ERROR: could not decode {path}"
-        lines = text.splitlines()
+        secret = _is_secret_file(path)
+        lines = [_redact_line(l, secret) for l in text.splitlines()]
         s = max(1, start_line or 1)
         e = min(len(lines), end_line or len(lines))
-        return "\n".join(f"{i}\t{lines[i - 1]}" for i in range(s, e + 1)) or "(empty)"
+        body = "\n".join(f"{i}\t{lines[i - 1]}" for i in range(s, e + 1)) or "(empty)"
+        if secret:
+            body = "# NOTE: secret values redacted; key names are real.\n" + body
+        return body
 
     def search_code(self, pattern: str, glob: str | None = None) -> str:
         try:
@@ -272,10 +311,11 @@ class Workspace:
             rel = str(p.relative_to(self.root))
             if glob and not fnmatch.fnmatch(rel, glob):
                 continue
+            secret = _is_secret_file(rel)
             try:
                 for n, line in enumerate(p.read_text("utf-8", errors="replace").splitlines(), 1):
                     if rx.search(line):
-                        hits.append(f"{rel}:{n}: {line.strip()[:200]}")
+                        hits.append(f"{rel}:{n}: {_redact_line(line.strip(), secret)[:200]}")
                         if len(hits) >= MAX_MATCHES:
                             hits.append(f"... (truncated at {MAX_MATCHES})")
                             return "\n".join(hits)
@@ -293,12 +333,14 @@ def run(root: Path, json_only: bool):
         "role": "user",
         "content": (
             f"Audit the project rooted at '{root.name}'. Start by fingerprinting the "
-            "stack, then scout and verify. Call submit_report when finished."
+            "stack, then scout and verify. Record each finding with report_finding as "
+            "you confirm it, and call finish_audit when done."
         ),
     }]
 
     findings = []
     meta = None
+    usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     for _ in range(MAX_ITERATIONS):
         # Stream so a long run can't hit the non-streaming HTTP timeout.
         try:
@@ -319,6 +361,13 @@ def run(root: Path, json_only: bool):
         except anthropic.APIError as ex:
             log(f"[error] API call failed: {ex}")
             break
+
+        u = getattr(resp, "usage", None)
+        if u:
+            usage["input"] += getattr(u, "input_tokens", 0) or 0
+            usage["output"] += getattr(u, "output_tokens", 0) or 0
+            usage["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
+            usage["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
 
         if resp.stop_reason == "refusal":
             log("[refused] the request was declined by safety classifiers")
@@ -381,11 +430,15 @@ def run(root: Path, json_only: bool):
     else:
         log(f"[warn] hit iteration cap ({MAX_ITERATIONS})")
 
+    cost = (usage["input"] * PRICE_IN + usage["output"] * PRICE_OUT
+            + usage["cache_write"] * PRICE_CACHE_WRITE
+            + usage["cache_read"] * PRICE_CACHE_READ) / 1_000_000
     return {
         "summary": _clean_text((meta or {}).get("summary", "")) or "Audit ended without a summary.",
         "files_reviewed": (meta or {}).get("files_reviewed", 0),
         "findings": findings,
         "notes": _clean_text((meta or {}).get("notes", "")),
+        "usage": {**usage, "estimated_cost_usd": round(cost, 4)},
     }
 
 
@@ -397,7 +450,12 @@ def print_human(report: dict):
     print("AI SAST REPORT")
     print("=" * 70)
     print(report.get("summary", ""))
-    print(f"\nFiles reviewed: {report.get('files_reviewed', 0)}   Findings: {len(findings)}\n")
+    print(f"\nFiles reviewed: {report.get('files_reviewed', 0)}   Findings: {len(findings)}")
+    u = report.get("usage", {})
+    if u:
+        print(f"Estimated cost: ${u.get('estimated_cost_usd', 0)}  "
+              f"({u.get('input', 0)} in / {u.get('output', 0)} out / {u.get('cache_read', 0)} cached tokens)")
+    print()
     for f in findings:
         print(f"[{f.get('severity')}/{f.get('confidence')}] {f.get('finding_id')} "
               f"{f.get('vulnerability_type')} ({f.get('cwe_id')})")
@@ -408,10 +466,79 @@ def print_human(report: dict):
         print(f"Notes: {report['notes']}")
 
 
+_SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+
+
+def to_sarif(report: dict) -> dict:
+    """SARIF 2.1.0 — the standard security-findings format that GitHub code
+    scanning, and most SAST dashboards, ingest directly."""
+    results = []
+    for f in report.get("findings", []):
+        results.append({
+            "ruleId": f.get("cwe_id") or f.get("finding_id") or "SEC",
+            "level": _SARIF_LEVEL.get(f.get("severity"), "warning"),
+            "message": {"text": (
+                f"[{f.get('severity')}/{f.get('confidence')}] {f.get('vulnerability_type')}\n"
+                f"Attack: {f.get('attack_vector')}\nFix: {f.get('remediation')}"
+            )},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": f.get("file", "")},
+                "region": {"startLine": max(1, int(f.get("line") or 1))},
+            }}],
+            "properties": {
+                "severity": f.get("severity"), "confidence": f.get("confidence"),
+                "owasp": f.get("owasp_category"), "poc": f.get("exploit_proof_of_concept"),
+            },
+        })
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "AI SAST Auditor",
+                "informationUri": "https://github.com/",
+                "rules": [],
+            }},
+            "results": results,
+        }],
+    }
+
+
+def to_markdown(report: dict) -> str:
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    findings = sorted(report.get("findings", []), key=lambda x: order.get(x.get("severity"), 9))
+    u = report.get("usage", {})
+    out = [
+        "# AI SAST Report", "",
+        report.get("summary", ""), "",
+        f"**Files reviewed:** {report.get('files_reviewed', 0)} · "
+        f"**Findings:** {len(findings)} · "
+        f"**Est. cost:** ${u.get('estimated_cost_usd', '?')}", "",
+    ]
+    for f in findings:
+        out += [
+            f"## {f.get('finding_id')} — {f.get('vulnerability_type')} ({f.get('cwe_id')})",
+            f"**{f.get('severity')} / {f.get('confidence')} confidence** · {f.get('owasp_category')}",
+            f"**Location:** `{f.get('file')}:{f.get('line')}`", "",
+            f"**Attack vector:** {f.get('attack_vector')}", "",
+            "**Proof of concept:**", "```", str(f.get("exploit_proof_of_concept", "")).strip(), "```",
+            f"**Verification:** {f.get('verification')}", "",
+            f"**Remediation:** {f.get('remediation')}", "",
+            "```", str(f.get("remediation_code", "")).strip(), "```", "",
+        ]
+    if report.get("notes"):
+        out += ["## Notes", report["notes"], ""]
+    return "\n".join(out)
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Local AI SAST auditor (OWASP Top 10, auth bypasses, insecure deserialization)."
+    )
     ap.add_argument("root", help="path to the project to audit")
     ap.add_argument("--json", action="store_true", help="emit only JSON on stdout")
+    ap.add_argument("--sarif", metavar="PATH", help="also write a SARIF 2.1.0 report to PATH")
+    ap.add_argument("--md", metavar="PATH", help="also write a Markdown report to PATH")
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -420,6 +547,11 @@ def main():
         sys.exit(2)
 
     report = run(root, args.json)
+
+    if args.sarif:
+        Path(args.sarif).write_text(json.dumps(to_sarif(report), indent=2))
+    if args.md:
+        Path(args.md).write_text(to_markdown(report))
 
     if args.json:
         print(json.dumps(report))  # stdout: machine-readable only
