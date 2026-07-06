@@ -1,0 +1,41 @@
+{
+  "name": "ai-sast-auditor",
+  "displayName": "AI SAST Auditor",
+  "description": "One-click AI security audit (OWASP Top 10, auth bypasses, insecure deserialization, logic flaws) from a status-bar button.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/ai-sast-auditor.git"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sast.analyze",
+        "title": "SAST: Analyze Workspace"
+      }
+    ],
+    "configuration": {
+      "title": "AI SAST Auditor",
+      "properties": {
+        "sast.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter used to run the auditor. Point this at the venv where you installed `anthropic` (e.g. /path/to/vscode-sast/.venv/bin/python)."
+        }
+      }
+    }
+  }
+}

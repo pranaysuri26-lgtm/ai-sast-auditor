@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node / VS Code extension
+node_modules/
+*.vsix
+
+# Tool artifacts
+.sast_ids.json
+sast_reports/
+
+# Secrets — never commit
+.env
+.env.*
+
+# macOS
+.DS_Store
