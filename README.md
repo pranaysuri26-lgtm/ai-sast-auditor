@@ -11,6 +11,10 @@ attack vector, proof-of-concept, verification trace, and a concrete fix on each.
 
 > Built for auditing code **you own or are authorized to test**.
 
+![AI SAST Auditor](docs/screenshot.svg)
+
+> _Placeholder banner — replace `docs/screenshot.svg` with a real screenshot of the Problems panel showing findings (a PNG works too; just update this path)._
+
 ---
 
 ## What makes it different from a generic "AI code review"
