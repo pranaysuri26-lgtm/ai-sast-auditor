@@ -17,3 +17,7 @@ sast_reports/
 
 # macOS
 .DS_Store
+
+# Local recordings/screenshots — not part of the source
+*.mov
+*.mp4

@@ -11,6 +11,9 @@ attack vector, proof-of-concept, verification trace, and a concrete fix on each.
 
 > Built for auditing code **you own or are authorized to test**.
 
+**Status: actively developed.** See [CHANGELOG.md](CHANGELOG.md) for what's
+shipped and the Roadmap below for what's next.
+
 ![AI SAST Auditor](docs/screenshot.svg)
 
 > _Placeholder banner — replace `docs/screenshot.svg` with a real screenshot of the Problems panel showing findings (a PNG works too; just update this path)._
@@ -52,7 +55,7 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
 # Package and install the extension
 npx @vscode/vsce package --no-dependencies --allow-star-activation
-code --install-extension ai-sast-auditor-0.0.1.vsix
+code --install-extension ai-sast-auditor-0.1.0.vsix
 ```
 
 Then in VS Code:
@@ -106,6 +109,25 @@ are sent, and secret-bearing files are redacted first.
 
 Each run prints an **estimated cost** (prompt caching keeps repeat context at
 ~0.1× price). Expect a few cents to ~$1 depending on repo size and effort.
+
+## Roadmap
+
+Real, currently-planned work — not a wishlist:
+
+- **Diff-mode CI** — audit only files changed since the last commit instead of
+  the whole repo on every push. Faster and cheaper for a per-PR check;
+  full-repo audits stay a periodic/manual run.
+- **Findings triage pass** — a cheap second pass (Haiku-class model) to
+  dedupe and rank raw findings once real-world false-positive volume
+  justifies it.
+- **Broader framework coverage** — the stack-fingerprinting step currently
+  tunes best for Next.js/Supabase, Django, Rails, and Spring; more
+  frameworks means more specific, less generic guidance per stack.
+- **Self-hosted / non-Anthropic model option** — for teams that need the
+  scan to run against a model they host themselves.
+
+Have a framework gap, a false positive, or a redaction bypass to report?
+Open an issue — this is exactly the kind of feedback the project needs.
 
 ## Limitations
 
